@@ -2,6 +2,8 @@
 
 A C++ library providing memory-mapped file operations through mmap_reader and mmap_writer classes.
 
+Since most scenarios involve either reading or writing, and to ensure safety and simplicity, this library provides `mmap_reader` and `mmap_writer` classes without support for simultaneous read and write operations.
+
 This library is only compatible with Linux systems.
 
 ## Features
