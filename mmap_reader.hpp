@@ -1,32 +1,36 @@
 #pragma once
 
 #include <cerrno>
+#include <cstring>
 #include <fcntl.h> // open
 #include <filesystem>
-#include <stdexcept>
+#include <optional>
+#include <span>
+#include <string>
 #include <string_view>
 #include <sys/mman.h> // mmap, munmap, msync
 #include <sys/stat.h> // fstat
-#include <system_error>
 #include <unistd.h>   // close
-#include <utility>    // exchange
+#include <utility>    // std::exchange
 
-using namespace std;
-
-class MmapReader
+class mmap_reader
 {
 private:
-    char* map_start {nullptr};
+    char* mapped_ptr {nullptr};
     size_t map_size {0};
     int fd {-1};
 
-    static int open_file(const filesystem::path& path)
+    size_t current_offset {0};
+
+    static int open_file(const std::filesystem::path& path)
     {
         const auto fd = ::open(path.c_str(), O_RDONLY);
 
         if (fd == -1)
         {
-            throw system_error {errno, system_category(), "cannot open file "s + path.string()};
+            throw std::system_error {errno,
+                                     std::system_category(),
+                                     std::string {"cannot open file "} + path.string()};
         }
 
         return fd;
@@ -39,15 +43,15 @@ private:
         {
             const auto old_errno = errno;
             ::close(fd);
-            throw system_error {old_errno,
-                                system_category(),
-                                "fstat failed with fd = "s + to_string(fd)};
+            throw std::system_error {old_errno,
+                                     std::system_category(),
+                                     std::string {"fstat failed with fd = "} + std::to_string(fd)};
         }
 
         return state_buf.st_size;
     }
 
-    void init()
+    void memory_map()
     {
         map_size = file_size(fd);
         void* addr = ::mmap(nullptr, map_size, PROT_READ, MAP_SHARED, fd, 0);
@@ -56,279 +60,321 @@ private:
         {
             const auto code = errno;
             ::close(fd);
-            throw system_error {code,
-                                system_category(),
-                                "mmap file fd = "s + to_string(fd) + "failed"};
+            throw std::system_error {code,
+                                     std::system_category(),
+                                     std::string {"mmap failed with fd = "} + std::to_string(fd)};
         }
-        map_start = static_cast<char*>(addr);
+        mapped_ptr = static_cast<char*>(addr);
     }
 
-public:
-    [[nodiscard]]
-    bool is_open() const
-    {
-        return map_start != nullptr;
-    }
-
-    explicit operator bool() const { return map_start != nullptr; }
-
-    void close() noexcept
-    {
-        if (is_open())
-        {
-            ::munmap(map_start, map_size);
-            ::close(fd);
-            map_start = nullptr;
-            map_size = 0;
-            fd = -1;
-        }
-    }
-    void open(const filesystem::path& path)
-    {
-        close();
-        fd = open_file(path);
-        init();
-    }
-
-    void open(const int fd)
-    {
-        close();
-        this->fd = fd;
-        init();
-    }
-
-    MmapReader() = default;
-    MmapReader(const filesystem::path& path) { open(path); }
-    MmapReader(int fd) { open(fd); }
-
-    ~MmapReader() { close(); }
-
-    MmapReader(const MmapReader&) = delete;
-    MmapReader& operator=(const MmapReader&) = delete;
-
-    MmapReader(MmapReader&& that) noexcept
-        : map_start {exchange(that.map_start, nullptr)},
-          map_size {exchange(that.map_size, 0)},
-          fd {exchange(that.fd, -1)}
-    {}
-
-    MmapReader& operator=(MmapReader&& that) noexcept
-    {
-        if (this != &that)
-        {
-            close();
-            map_start = exchange(that.map_start, nullptr);
-            map_size = exchange(that.map_size, 0);
-            fd = exchange(that.fd, -1);
-        }
-
-        return *this;
-    }
-
-    [[nodiscard]]
-    size_t size() const
-    {
-        return map_size;
-    }
-
-    [[nodiscard]]
-    string_view view() const
-    {
-        return {map_start, map_size};
-    }
-
-    [[nodiscard]]
-    string str() const
-    {
-        return {map_start, map_size};
-    }
-
-    [[nodiscard]]
-    const char* data() const noexcept
-    {
-        return map_start;
-    }
-};
-
-class MmapLineReader
-{
 private:
-    MmapReader* in {};
-    char delimiter {'\n'};
-
-public:
-    explicit MmapLineReader(MmapReader& in_) : in {&in_} {}
-
-    void set_delimiter(char delimiter_) { delimiter = delimiter_; }
-
-    bool read_line(string_view& out, size_t& offset)
+    [[nodiscard]]
+    bool eof() const noexcept
     {
-        if (offset == in->size()) { return false; }
+        return current_offset >= map_size;
+    }
 
-        size_t cur {offset};
-        int found_delimiter {0};
+    char next_char() noexcept { return mapped_ptr[current_offset++]; }
 
-        while (cur < in->size())
+    std::string_view next_line(char delimiter) noexcept
+    {
+        size_t cur = current_offset;
+        int found_delimiter = 0;
+
+        while (cur < map_size)
         {
-            if (in->data()[cur++] == delimiter)
+            if (mapped_ptr[cur++] == delimiter)
             {
                 found_delimiter = 1;
                 break;
             }
         }
 
-        out = string_view {in->data() + offset, cur - offset - found_delimiter};
-        offset = cur;
+        std::string_view line {mapped_ptr + current_offset, cur - current_offset - found_delimiter};
 
-        return true;
+        current_offset = cur;
+
+        return line;
     }
 
-    class iterator
+    class LineReader
     {
     private:
-        MmapLineReader* reader {};
-        size_t offset {};
-        string_view line;
+        mmap_reader* reader;
+        char delimiter;
+
+        class iterator
+        {
+        private:
+            mmap_reader* reader {};
+            char delimiter {};
+
+        public:
+            iterator() = default;
+            iterator(mmap_reader* in_, char delimiter_) : reader {in_}, delimiter {delimiter_} {}
+
+            std::string_view operator*() const noexcept { return reader->next_line(delimiter); }
+
+            iterator& operator++() { return *this; }
+
+            bool operator!=([[maybe_unused]] const iterator& eof_iter) const noexcept
+            {
+                return !reader->eof();
+            }
+        };
 
     public:
-        typedef string_view value_type;
-        typedef const value_type* pointer;
-        typedef const value_type& reference;
-        typedef ptrdiff_t difference_type;
-        typedef std::forward_iterator_tag iterator_category;
+        explicit LineReader(mmap_reader& r, char delim = '\n') : reader(&r), delimiter(delim) {}
 
-        iterator() = default;
-        explicit iterator(MmapLineReader* reader_) : reader {reader_} { ++*this; }
-
-        reference operator*() const noexcept { return line; }
-        pointer operator->() const noexcept { return &line; }
-        iterator& operator++()
-        {
-            if (!reader->read_line(line, offset))
-            {
-                reader = nullptr;
-                offset = 0;
-            }
-            return *this;
-        }
-        iterator operator++(int)
-        {
-            iterator temp(*this);
-            ++*this;
-            return temp;
-        }
-
-        bool operator==(const iterator& rhs) const noexcept
-        {
-            return reader == rhs.reader && offset == rhs.offset;
-        }
-        bool operator!=(const iterator& that) const noexcept { return !operator==(that); }
+        iterator begin() { return iterator {reader, delimiter}; }
+        iterator end() { return {}; }
     };
 
-    iterator begin() { return iterator {this}; }
-    iterator end() const noexcept { return iterator {}; }
-};
+    class CharReader
+    {
+    private:
+        mmap_reader* reader;
 
+        class iterator
+        {
+        private:
+            mmap_reader* reader {};
 
-class MmapCharReader
-{
-private:
-    MmapReader* in {};
+        public:
+            iterator() = default;
+            explicit iterator(mmap_reader* in_) : reader {in_} {}
+
+            char operator*() const noexcept { return reader->next_char(); }
+
+            iterator& operator++() { return *this; }
+
+            bool operator!=([[maybe_unused]] const iterator& eof_iter) const noexcept
+            {
+                return !reader->eof();
+            }
+        };
+
+    public:
+        explicit CharReader(mmap_reader& r) : reader {&r} {}
+
+        iterator begin() { return iterator {reader}; }
+        iterator end() { return {}; }
+    };
 
 public:
-    MmapCharReader(MmapReader& in_) : in {&in_} {}
-
     [[nodiscard]]
-    const char& read_char(size_t offset) const noexcept
+    bool is_open() const noexcept
     {
-        return in->data()[offset];
+        return mapped_ptr != nullptr;
     }
 
-    class iterator
+    explicit operator bool() const noexcept { return is_open() && current_offset < map_size; }
+
+    void close() noexcept
     {
-    private:
-        const MmapCharReader* reader {};
-        size_t offset {};
+        if (is_open())
+        {
+            ::munmap(mapped_ptr, map_size);
+            ::close(fd);
+            mapped_ptr = nullptr;
+            map_size = 0;
+            fd = -1;
+            current_offset = 0;
+        }
+    }
 
-    public:
-        typedef std::contiguous_iterator_tag iterator_concept;
-        typedef char value_type;
-        typedef const char* pointer;
-        typedef const char& reference;
-        typedef ptrdiff_t difference_type;
-        typedef std::random_access_iterator_tag iterator_category;
+    void open(const std::filesystem::path& path)
+    {
+        close();
+        fd = open_file(path);
+        memory_map();
+    }
 
-        iterator() = default;
-        explicit iterator(const MmapCharReader* reader, size_t offset = 0) noexcept
-            : reader(reader), offset(offset)
-        {}
+    void open(const int new_fd)
+    {
+        close();
+        fd = new_fd;
+        memory_map();
+    }
 
-        reference operator*() const noexcept { return reader->read_char(offset); }
-        pointer operator->() const noexcept { return &reader->read_char(offset); }
+    mmap_reader() = default;
+    explicit mmap_reader(const std::filesystem::path& path) { open(path); }
+    explicit mmap_reader(int fd) { open(fd); }
 
-        iterator& operator++() noexcept
-        {
-            ++offset;
-            return *this;
-        }
-        iterator operator++(int) noexcept
-        {
-            iterator temp(*this);
-            ++*this;
-            return temp;
-        }
-        iterator& operator--() noexcept
-        {
-            --offset;
-            return *this;
-        }
-        iterator operator--(int) noexcept
-        {
-            iterator temp(*this);
-            --*this;
-            return temp;
-        }
-        iterator& operator+=(ptrdiff_t n) noexcept
-        {
-            offset += n;
-            return *this;
-        }
-        iterator& operator-=(ptrdiff_t n) noexcept
-        {
-            offset -= n;
-            return *this;
-        }
-        iterator operator+(ptrdiff_t n) const noexcept { return iterator(reader, offset + n); }
-        iterator operator-(ptrdiff_t n) const noexcept { return iterator(reader, offset - n); }
-        difference_type operator-(const iterator& rhs) const noexcept
-        {
-            return offset - rhs.offset;
-        }
-        reference operator[](difference_type n) const noexcept
-        {
-            return reader->read_char(offset + n);
-        }
-        friend iterator operator+(difference_type n, iterator i) noexcept { return i + n; }
+    ~mmap_reader() { close(); }
 
-        bool operator==(const iterator& rhs) const noexcept
+    mmap_reader(const mmap_reader&) = delete;
+    mmap_reader& operator=(const mmap_reader&) = delete;
+
+    mmap_reader(mmap_reader&& that) noexcept
+        : mapped_ptr {std::exchange(that.mapped_ptr, nullptr)},
+          map_size {std::exchange(that.map_size, 0)},
+          fd {std::exchange(that.fd, -1)},
+          current_offset {std::exchange(that.current_offset, 0)}
+    {}
+
+    mmap_reader& operator=(mmap_reader&& that) noexcept
+    {
+        if (this != &that)
         {
-            return reader == rhs.reader && offset == rhs.offset;
+            close();
+            mapped_ptr = std::exchange(that.mapped_ptr, nullptr);
+            map_size = std::exchange(that.map_size, 0);
+            fd = std::exchange(that.fd, -1);
+            current_offset = std::exchange(that.current_offset, 0);
         }
-        bool operator!=(const iterator& rhs) const noexcept { return !operator==(rhs); }
-        bool operator<(const iterator& rhs) const noexcept
-        {
-            return reader < rhs.reader || (reader == rhs.reader && offset < rhs.offset);
-        }
-        bool operator>(const iterator& rhs) const noexcept
-        {
-            return reader > rhs.reader || (reader == rhs.reader && offset > rhs.offset);
-        }
-        bool operator<=(const iterator& rhs) const noexcept { return !operator>(rhs); }
-        bool operator>=(const iterator& rhs) const noexcept { return !operator<(rhs); }
+
+        return *this;
+    }
+
+    [[nodiscard]]
+    const char* data() const noexcept
+    {
+        return mapped_ptr;
+    }
+
+    [[nodiscard]]
+    size_t size() const noexcept
+    {
+        return map_size;
+    }
+
+    [[nodiscard]]
+    size_t tell() const noexcept
+    {
+        return current_offset;
+    }
+
+    void seek(size_t pos) noexcept { current_offset = std::min(pos, map_size); }
+
+    enum seekdir : unsigned char
+    {
+        beg,
+        cur,
+        end
     };
 
-    typedef iterator const_iterator;
+    void seek(ptrdiff_t off, seekdir dir) noexcept
+    {
+        switch (dir)
+        {
+        case seekdir::beg:
+            if (off < 0) { current_offset = 0; }
+            else { current_offset = std::min(static_cast<size_t>(off), map_size); }
+            break;
+        case seekdir::cur:
+            if (off < 0)
+            {
+                current_offset = (static_cast<size_t>(-off) > current_offset)
+                                     ? 0
+                                     : current_offset - static_cast<size_t>(-off);
+            }
+            else { current_offset = std::min(current_offset + static_cast<size_t>(off), map_size); }
+            break;
+        case seekdir::end:
+            if (off < 0)
+            {
+                current_offset = (static_cast<size_t>(-off) > map_size)
+                                     ? 0
+                                     : map_size - static_cast<size_t>(-off);
+            }
+            else { current_offset = map_size; }
+            break;
+        }
+    }
 
-    iterator begin() const noexcept { return iterator(this); }
-    iterator end() const noexcept { return iterator(this, in->size()); }
+    size_t read(std::span<char> buf) noexcept
+    {
+        const size_t to_read = std::min(buf.size(), map_size - current_offset);
+        memcpy(buf.data(), mapped_ptr + current_offset, to_read);
+
+        current_offset += to_read;
+
+        return to_read;
+    }
+
+    size_t pread(std::span<char> buf, size_t offset) const noexcept
+    {
+        if (offset >= map_size) { return 0; }
+
+        const size_t to_read = std::min(buf.size(), map_size - offset);
+        memcpy(buf.data(), mapped_ptr + offset, to_read);
+
+        return to_read;
+    }
+
+    [[nodiscard]]
+    std::optional<std::string_view> getline(char delimiter = '\n') noexcept
+    {
+        if (current_offset >= map_size) { return std::nullopt; }
+
+        size_t cur = current_offset;
+        int found_delimiter = 0;
+
+        while (cur < map_size)
+        {
+            if (mapped_ptr[cur++] == delimiter)
+            {
+                found_delimiter = 1;
+                break;
+            }
+        }
+
+        std::string_view line {mapped_ptr + current_offset, cur - current_offset - found_delimiter};
+
+        current_offset = cur;
+
+        return line;
+    }
+
+    [[nodiscard]]
+    std::optional<char> getchar() noexcept
+    {
+        if (current_offset >= map_size) { return std::nullopt; }
+        return mapped_ptr[current_offset++];
+    }
+
+    [[nodiscard]]
+    LineReader lines(char delimiter = '\n')
+    {
+        return LineReader(*this, delimiter);
+    }
+
+    [[nodiscard]]
+    CharReader chars()
+    {
+        return CharReader(*this);
+    }
+
+    [[nodiscard]]
+    std::string_view view() const noexcept
+    {
+        return {mapped_ptr, map_size};
+    }
+
+    [[nodiscard]]
+    std::string str() const
+    {
+        return {mapped_ptr, map_size};
+    }
+
+    [[nodiscard]]
+    std::string_view view(size_t offset, size_t len) const noexcept
+    {
+        if (offset >= map_size) { return {}; }
+
+        const size_t available = map_size - offset;
+        const size_t actual_len = std::min(len, available);
+        return {mapped_ptr + offset, actual_len};
+    }
+
+    [[nodiscard]]
+    std::string str(size_t offset, size_t len) const
+    {
+        if (offset >= map_size) { return {}; }
+
+        const size_t available = map_size - offset;
+        const size_t actual_len = std::min(len, available);
+        return {mapped_ptr + offset, actual_len};
+    }
 };
