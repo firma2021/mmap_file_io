@@ -2,6 +2,8 @@
 
 A C++ library providing memory-mapped file operations through mmap_reader and mmap_writer classes.
 
+This library is only compatible with Linux systems.
+
 ## Features
 
 - Zero-copy operations through memory mapping
