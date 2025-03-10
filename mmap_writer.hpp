@@ -28,13 +28,19 @@ private:
 
         if (ftruncate(fd, static_cast<off_t>(new_capacity)) == -1)
         {
-            throw std::system_error {errno, std::system_category(), "ftruncate failed"};
+            const auto code = errno;
+            ::munmap(mapped_ptr, capacity);
+            ::close(fd);
+            throw std::system_error {code, std::system_category(), "ftruncate failed"};
         }
 
         void* new_ptr = mremap(mapped_ptr, capacity, new_capacity, MREMAP_MAYMOVE);
         if (new_ptr == MAP_FAILED)
         {
-            throw std::system_error {errno, std::system_category(), "mremap failed"};
+            const auto code = errno;
+            ::munmap(mapped_ptr, capacity);
+            ::close(fd);
+            throw std::system_error {code, std::system_category(), "mremap failed"};
         }
 
         mapped_ptr = static_cast<char*>(new_ptr);
@@ -57,7 +63,9 @@ private:
             struct stat sb;
             if (fstat(fd, &sb) == -1)
             {
-                throw std::system_error {errno, std::system_category(), "fstat failed"};
+                const auto code = errno;
+                ::close(fd);
+                throw std::system_error {code, std::system_category(), "fstat failed"};
             }
             current_offset = static_cast<size_t>(sb.st_size);
         }
@@ -66,12 +74,16 @@ private:
 
         if (ftruncate(fd, static_cast<off_t>(capacity)) == -1)
         {
-            throw std::system_error {errno, std::system_category(), "ftruncate failed"};
+            const auto code = errno;
+            ::close(fd);
+            throw std::system_error {code, std::system_category(), "ftruncate failed"};
         }
 
         void* addr = mmap(nullptr, capacity, PROT_WRITE, MAP_SHARED, fd, 0);
         if (addr == MAP_FAILED)
         {
+            const auto code = errno;
+            ::close(fd);
             throw std::system_error {errno, std::system_category(), "mmap failed"};
         }
         mapped_ptr = static_cast<char*>(addr);
