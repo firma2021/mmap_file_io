@@ -1,98 +1,154 @@
 #pragma once
 
+#include <algorithm>
 #include <cerrno>
-#include <cstring>
+#include <cstdio>  // perror
 #include <fcntl.h> // open
-#include <filesystem>
+#include <format>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/mman.h> // mmap, munmap, msync
 #include <sys/stat.h> // fstat
 #include <unistd.h>   // close
-#include <utility>    // std::exchange
 
 class mmap_reader
 {
 private:
-    char* mapped_ptr {nullptr};
-    size_t map_size {0};
-    int fd {-1};
-
-    size_t current_offset {0};
-
-    static int open_file(const std::filesystem::path& path)
+    struct File
     {
-        const auto fd = ::open(path.c_str(), O_RDONLY);
-
-        if (fd == -1)
+    private:
+        static int open(std::string_view path)
         {
-            throw std::system_error {errno,
-                                     std::system_category(),
-                                     std::string {"cannot open file "} + path.string()};
+            const int fd = ::open(path.data(), O_RDONLY);
+
+            if (fd == -1)
+            {
+                throw std::system_error {errno,
+                                         std::system_category(),
+                                         std::format("mmap_reader: cannot open file {}", path)};
+            }
+
+            return fd;
         }
 
-        return fd;
-    }
-
-    static size_t file_size(int fd)
-    {
-        struct stat state_buf;
-        if (::fstat(fd, &state_buf) == -1)
+        void close()
         {
-            const auto old_errno = errno;
-            ::close(fd);
-            throw std::system_error {old_errno,
-                                     std::system_category(),
-                                     std::string {"fstat failed with fd = "} + std::to_string(fd)};
+            if (should_close && ::close(fd) == -1) { perror("mmap_reader: close file failed"); }
         }
 
-        return state_buf.st_size;
-    }
+    public:
+        int fd;
+        bool should_close;
 
-    void memory_map()
-    {
-        map_size = file_size(fd);
-        void* addr = ::mmap(nullptr, map_size, PROT_READ, MAP_SHARED, fd, 0);
+        explicit File(std::string_view path) : fd {open(path)}, should_close {true} {}
 
-        if (addr == MAP_FAILED)
+        explicit File(int fd) : fd {fd}, should_close {false}
         {
-            const auto code = errno;
-            ::close(fd);
-            throw std::system_error {code,
-                                     std::system_category(),
-                                     std::string {"mmap failed with fd = "} + std::to_string(fd)};
+            if (fd < 0) { throw std::invalid_argument {"mmap_reader: invalid file descriptor"}; }
         }
-        mapped_ptr = static_cast<char*>(addr);
-    }
+
+        ~File() { close(); }
+
+        File(const File&) = delete;
+        File& operator=(const File&) = delete;
+        File(File&& that) noexcept = delete;
+        File& operator=(File&& that) noexcept = delete;
+    };
+
+    struct MmapData
+    {
+    private:
+        static size_t file_size(int fd)
+        {
+            struct stat state_buf;
+            if (::fstat(fd, &state_buf) == -1)
+            {
+                throw std::system_error {errno,
+                                         std::system_category(),
+                                         std::string {"mmap_reader: fstat failed with fd = "} +
+                                             std::to_string(fd)};
+            }
+
+            return state_buf.st_size;
+        }
+
+        void memory_map(int fd)
+        {
+            map_size = file_size(fd);
+
+            void* addr = ::mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (addr == MAP_FAILED)
+            {
+                throw std::system_error {errno,
+                                         std::system_category(),
+                                         std::string {"mmap_reader: mmap failed with fd = "} +
+                                             std::to_string(fd)};
+            }
+
+            mapped_ptr = static_cast<char*>(addr);
+        }
+
+        void unmap()
+        {
+            if (::munmap(mapped_ptr, map_size) == -1) { perror("mmap_reader: munmap failed"); }
+        }
+
+    public:
+        char* mapped_ptr;
+        size_t map_size;
+
+        explicit MmapData(int fd) { memory_map(fd); }
+        ~MmapData() { unmap(); }
+
+        MmapData(const MmapData&) = delete;
+        MmapData& operator=(const MmapData&) = delete;
+
+        MmapData(MmapData&& that) noexcept = delete;
+
+        MmapData& operator=(MmapData&& that) noexcept = delete;
+    };
+
+    File file;
+    MmapData mmap_data;
+
+    size_t read_pos {0};
+
+    enum class seekdir : unsigned char
+    {
+        beg,
+        cur,
+        end
+    };
 
 private:
     [[nodiscard]]
     bool eof() const noexcept
     {
-        return current_offset >= map_size;
+        return read_pos >= mmap_data.map_size;
     }
 
-    char next_char() noexcept { return mapped_ptr[current_offset++]; }
+    char next_char() noexcept { return mmap_data.mapped_ptr[read_pos++]; }
 
     std::string_view next_line(char delimiter) noexcept
     {
-        size_t cur = current_offset;
         int found_delimiter = 0;
 
-        while (cur < map_size)
+        size_t cur = read_pos;
+        while (cur < mmap_data.map_size)
         {
-            if (mapped_ptr[cur++] == delimiter)
+            if (mmap_data.mapped_ptr[cur++] == delimiter)
             {
                 found_delimiter = 1;
                 break;
             }
         }
 
-        std::string_view line {mapped_ptr + current_offset, cur - current_offset - found_delimiter};
+        std::string_view line {mmap_data.mapped_ptr + read_pos, cur - read_pos - found_delimiter};
 
-        current_offset = cur;
+        read_pos = cur;
 
         return line;
     }
@@ -100,205 +156,142 @@ private:
     class LineReader
     {
     private:
-        mmap_reader* reader;
+        mmap_reader& reader;
         char delimiter;
 
         class iterator
         {
         private:
-            mmap_reader* reader {};
+            mmap_reader& reader;
             char delimiter {};
 
         public:
-            iterator() = default;
-            iterator(mmap_reader* in_, char delimiter_) : reader {in_}, delimiter {delimiter_} {}
+            iterator(mmap_reader& in_, char delimiter_) : reader {in_}, delimiter {delimiter_} {}
 
-            std::string_view operator*() const noexcept { return reader->next_line(delimiter); }
+            std::string_view operator*() const noexcept { return reader.next_line(delimiter); }
 
             iterator& operator++() { return *this; }
 
             bool operator!=([[maybe_unused]] const iterator& eof_iter) const noexcept
             {
-                return !reader->eof();
+                return !reader.eof();
             }
         };
 
     public:
-        explicit LineReader(mmap_reader& r, char delim = '\n') : reader(&r), delimiter(delim) {}
+        explicit LineReader(mmap_reader& r, char delim) : reader {r}, delimiter {delim} {}
 
         iterator begin() { return iterator {reader, delimiter}; }
-        iterator end() { return {}; }
+        iterator end() { return iterator {reader, delimiter}; }
     };
 
     class CharReader
     {
     private:
-        mmap_reader* reader;
+        mmap_reader& reader;
 
         class iterator
         {
         private:
-            mmap_reader* reader {};
+            mmap_reader& reader;
 
         public:
-            iterator() = default;
-            explicit iterator(mmap_reader* in_) : reader {in_} {}
+            explicit iterator(mmap_reader& in_) : reader {in_} {}
 
-            char operator*() const noexcept { return reader->next_char(); }
+            char operator*() const noexcept { return reader.next_char(); }
 
             iterator& operator++() { return *this; }
 
             bool operator!=([[maybe_unused]] const iterator& eof_iter) const noexcept
             {
-                return !reader->eof();
+                return !reader.eof();
             }
         };
 
     public:
-        explicit CharReader(mmap_reader& r) : reader {&r} {}
+        explicit CharReader(mmap_reader& r) : reader {r} {}
 
         iterator begin() { return iterator {reader}; }
-        iterator end() { return {}; }
+        iterator end() { return iterator {reader}; }
     };
 
 public:
-    [[nodiscard]]
-    bool is_open() const noexcept
-    {
-        return mapped_ptr != nullptr;
-    }
+    explicit mmap_reader(std::string_view path) : file {path}, mmap_data {file.fd} {}
+    explicit mmap_reader(int fd) : file {fd}, mmap_data {fd} {}
 
-    explicit operator bool() const noexcept { return is_open() && current_offset < map_size; }
-
-    void close() noexcept
-    {
-        if (is_open())
-        {
-            ::munmap(mapped_ptr, map_size);
-            ::close(fd);
-            mapped_ptr = nullptr;
-            map_size = 0;
-            fd = -1;
-            current_offset = 0;
-        }
-    }
-
-    void open(const std::filesystem::path& path)
-    {
-        close();
-        fd = open_file(path);
-        memory_map();
-    }
-
-    void open(const int new_fd)
-    {
-        close();
-        fd = new_fd;
-        memory_map();
-    }
-
-    mmap_reader() = default;
-    explicit mmap_reader(const std::filesystem::path& path) { open(path); }
-    explicit mmap_reader(int fd) { open(fd); }
-
-    ~mmap_reader() { close(); }
-
-    mmap_reader(const mmap_reader&) = delete;
-    mmap_reader& operator=(const mmap_reader&) = delete;
-
-    mmap_reader(mmap_reader&& that) noexcept
-        : mapped_ptr {std::exchange(that.mapped_ptr, nullptr)},
-          map_size {std::exchange(that.map_size, 0)},
-          fd {std::exchange(that.fd, -1)},
-          current_offset {std::exchange(that.current_offset, 0)}
-    {}
-
-    mmap_reader& operator=(mmap_reader&& that) noexcept
-    {
-        if (this != &that)
-        {
-            close();
-            mapped_ptr = std::exchange(that.mapped_ptr, nullptr);
-            map_size = std::exchange(that.map_size, 0);
-            fd = std::exchange(that.fd, -1);
-            current_offset = std::exchange(that.current_offset, 0);
-        }
-
-        return *this;
-    }
+    explicit operator bool() const noexcept { return !eof(); }
 
     [[nodiscard]]
     const char* data() const noexcept
     {
-        return mapped_ptr;
+        return mmap_data.mapped_ptr;
     }
 
     [[nodiscard]]
     size_t size() const noexcept
     {
-        return map_size;
+        return mmap_data.map_size;
     }
 
     [[nodiscard]]
     size_t tell() const noexcept
     {
-        return current_offset;
+        return read_pos;
     }
 
-    void seek(size_t pos) noexcept { current_offset = std::min(pos, map_size); }
+    void seek(size_t pos) noexcept { read_pos = std::min(pos, mmap_data.map_size); }
 
-    enum seekdir : unsigned char
-    {
-        beg,
-        cur,
-        end
-    };
+    static const seekdir beg {seekdir::beg};
+    static const seekdir cur {seekdir::cur};
+    static const seekdir end {seekdir::end};
 
     void seek(ptrdiff_t off, seekdir dir) noexcept
     {
         switch (dir)
         {
         case seekdir::beg:
-            if (off < 0) { current_offset = 0; }
-            else { current_offset = std::min(static_cast<size_t>(off), map_size); }
+            if (off < 0) { read_pos = 0; }
+            else { read_pos = std::min(static_cast<size_t>(off), mmap_data.map_size); }
             break;
         case seekdir::cur:
             if (off < 0)
             {
-                current_offset = (static_cast<size_t>(-off) > current_offset)
-                                     ? 0
-                                     : current_offset - static_cast<size_t>(-off);
+                read_pos = (static_cast<size_t>(-off) > read_pos)
+                               ? 0
+                               : read_pos - static_cast<size_t>(-off);
             }
-            else { current_offset = std::min(current_offset + static_cast<size_t>(off), map_size); }
+            else { read_pos = std::min(read_pos + static_cast<size_t>(off), mmap_data.map_size); }
             break;
         case seekdir::end:
             if (off < 0)
             {
-                current_offset = (static_cast<size_t>(-off) > map_size)
-                                     ? 0
-                                     : map_size - static_cast<size_t>(-off);
+                read_pos = (static_cast<size_t>(-off) > mmap_data.map_size)
+                               ? 0
+                               : mmap_data.map_size - static_cast<size_t>(-off);
             }
-            else { current_offset = map_size; }
+            else { read_pos = mmap_data.map_size; }
+            break;
+        default:
             break;
         }
     }
 
-    size_t read(std::span<char> buf) noexcept
+    std::span<char> read(std::span<char> buf) noexcept
     {
-        const size_t to_read = std::min(buf.size(), map_size - current_offset);
-        memcpy(buf.data(), mapped_ptr + current_offset, to_read);
+        const size_t to_read = std::min(buf.size(), mmap_data.map_size - read_pos);
+        std::copy_n(mmap_data.mapped_ptr + read_pos, to_read, buf.data());
 
-        current_offset += to_read;
+        read_pos += to_read;
 
-        return to_read;
+        return buf.first(to_read);
     }
 
     size_t pread(std::span<char> buf, size_t offset) const noexcept
     {
-        if (offset >= map_size) { return 0; }
+        if (offset >= mmap_data.map_size) { return 0; }
 
-        const size_t to_read = std::min(buf.size(), map_size - offset);
-        memcpy(buf.data(), mapped_ptr + offset, to_read);
+        const size_t to_read = std::min(buf.size(), mmap_data.map_size - offset);
+        std::copy_n(mmap_data.mapped_ptr + offset, to_read, buf.data());
 
         return to_read;
     }
@@ -306,32 +299,15 @@ public:
     [[nodiscard]]
     std::optional<std::string_view> getline(char delimiter = '\n') noexcept
     {
-        if (current_offset >= map_size) { return std::nullopt; }
-
-        size_t cur = current_offset;
-        int found_delimiter = 0;
-
-        while (cur < map_size)
-        {
-            if (mapped_ptr[cur++] == delimiter)
-            {
-                found_delimiter = 1;
-                break;
-            }
-        }
-
-        std::string_view line {mapped_ptr + current_offset, cur - current_offset - found_delimiter};
-
-        current_offset = cur;
-
-        return line;
+        if (eof()) { return std::nullopt; }
+        return next_line(delimiter);
     }
 
     [[nodiscard]]
     std::optional<char> getchar() noexcept
     {
-        if (current_offset >= map_size) { return std::nullopt; }
-        return mapped_ptr[current_offset++];
+        if (eof()) { return std::nullopt; }
+        return next_char();
     }
 
     [[nodiscard]]
@@ -349,32 +325,28 @@ public:
     [[nodiscard]]
     std::string_view view() const noexcept
     {
-        return {mapped_ptr, map_size};
+        return {mmap_data.mapped_ptr, mmap_data.map_size};
     }
 
     [[nodiscard]]
     std::string str() const
     {
-        return {mapped_ptr, map_size};
+        return {mmap_data.mapped_ptr, mmap_data.map_size};
     }
 
     [[nodiscard]]
     std::string_view view(size_t offset, size_t len) const noexcept
     {
-        if (offset >= map_size) { return {}; }
+        if (offset >= mmap_data.map_size) { return {}; }
 
-        const size_t available = map_size - offset;
+        const size_t available = mmap_data.map_size - offset;
         const size_t actual_len = std::min(len, available);
-        return {mapped_ptr + offset, actual_len};
+        return {mmap_data.mapped_ptr + offset, actual_len};
     }
 
     [[nodiscard]]
     std::string str(size_t offset, size_t len) const
     {
-        if (offset >= map_size) { return {}; }
-
-        const size_t available = map_size - offset;
-        const size_t actual_len = std::min(len, available);
-        return {mapped_ptr + offset, actual_len};
+        return std::string {view(offset, len)};
     }
 };

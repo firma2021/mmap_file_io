@@ -8,19 +8,19 @@ This library is only compatible with Linux systems.
 
 ## Features
 
-- Zero-copy operations through memory mapping
-- RAII design. Move-only
-- All operations that can fail throw `std::system_error` with appropriate error codes and messages
+- Zero-copy operations through memory mapping.
+- RAII design. Neither copyable nor movabley.
+- All IO operations that can fail throw `std::system_error` with appropriate messages.
 
 ### mmap_reader
-- Multiple reading modes (whole file, line-by-line, char-by-char)
-- Iterator support for lines and characters
-- Support direct position reading, random access reading, seek operations
+- Multiple reading modes (whole file, line-by-line, char-by-char).
+- Iterator support for lines and characters.
+- Support direct position reading, random access reading, seek operations.
 
 ### mmap_writer
-- Support for both truncate and append modes
-- Automatic file expansion. Configurable expansion size. Default expansion size: 8192 bytes
-- Support direct position writing, random access writing, seek operations
+- Support for both truncate and append modes.
+- Automatic file expansion. Configurable expansion size. Default expansion size: 8192 bytes.
+- Support direct position writing, random access writing, seek operations.
 
 ## Basic Usage
 
@@ -55,7 +55,9 @@ reader.pread(str, 6);
 
 ### mmap_writer
 ```cpp
-mmap_writer writer("example.txt", true); // Create/open a file, truncate = true
+#include "mmap_writer.hpp"
+
+mmap_writer writer("example.txt", true, 1024 * 1024); // Create/open a file, truncate = true, reserved size = 1024 * 1024 bytes
 
 std::string data = "Hello, World!";
 writer.write(data);
@@ -68,42 +70,32 @@ writer.write(data);
 - In `mmap_reader`, the methods `view()`, `str()`, and `pread()` do not modify the current offset.
 - In `mmap_writer`, the method `pwrite()` does not modify the current offset.
 - If you want to change the offset after calling these methods, you need to manually call `seek()`.
-
+- Both classes are neither copyable nor movable.
+- Neither class provides open() or close() methods - files are opened in the constructor and closed in the destructor.
+- When constructing with a filename, the file is automatically closed in the destructor. When constructing with a file descriptor, the file descriptor is not closed in the destructor.
 
 ### mmap_reader
 
 #### Constructor
-- `mmap_reader()`
-  - Default constructor, creates an empty reader.
-
-- `explicit mmap_reader(const std::filesystem::path& path)`
-  - Construct and open file at specified path.
+- `explicit mmap_reader(std::string_view path)`
+  - Constructs a reader and opens the file at the specified path.
+  - Throws std::system_error if file cannot be opened or mapped.
 
 - `explicit mmap_reader(int fd)`
-  - Construct from existing file descriptor.
-
-#### File Operations
-- `void open(const std::filesystem::path& path)`
-  - Open file by path.
-
-- `void open(const int new_fd)`
-  - Open file by descriptor.
-
-- `void close() noexcept`
-  - Close file and cleanup.
-
-- `bool is_open() const noexcept`
-  - Check if file is open.
-
-- `explicit operator bool() const noexcept`
-  - Check if file is open and readable.
+  - Constructs a reader from an existing file descriptor.
+  - The file descriptor will not be closed in the destructor.
+  - Throws std::invalid_argument if fd is invalid.
 
 #### Reading Operations
-- `size_t read(std::span<char> buf) noexcept`
-  - Read data into provided buffer, returns bytes read.
+- `std::span<char> read(std::span<char> buf) noexcept`
+  - Reads data into the provided buffer starting from current position.
+  - Returns a span representing the portion of the buffer that was filled.
+  - Advances the current position by the number of bytes read.
 
 - `size_t pread(std::span<char> buf, size_t offset) const noexcept`
-  - Read from specific offset into buffer.
+  - Reads data into the provided buffer starting from the specified offset.
+  - Returns the number of bytes read.
+  - Does not change the current position.
 
 - `std::optional<std::string_view> getline(char delimiter = '\n')`
   - Read next line until delimiter.
@@ -135,41 +127,39 @@ writer.write(data);
   - Get current position.
 
 - `void seek(size_t pos) noexcept`
-  - Seek to absolute position.
+  - Sets the read position to the specified absolute position.
+  - If pos is beyond the file size, sets position to end of file.
 
 - `void seek(ptrdiff_t off, seekdir dir) noexcept`
-  - Seeks relative to beginning (beg), current position (cur), or end (end).
+  - Sets the read position relative to a reference point.
+  - dir can be seekdir::beg (beginning), seekdir::cur (current position), or seekdir::end (end of file).
+  - Supports negative offsets.
+  - Clamps to file boundaries.
 
 #### Iterators
 - `LineReader lines(char delimiter = '\n')`
-  - Get line iterators.
+  - Returns an iterator range for reading lines.
+  - Each iteration returns a line as string_view (excluding delimiter).
 
 - `CharReader chars()`
-  - Get character iterators.
+  - Returns an iterator range for reading characters.
+  - Each iteration returns a single character.
 
 ---
 
 ### mmap_writer
 
 #### Constructor
-- `mmap_writer(const std::filesystem::path& filename, bool truncate)`
+- `mmap_writer(std::string_view filename, bool truncate, size_t reserved_size = 0)`
   - Creates a new writer for the specified file.
-  - `truncate`: If true, truncates existing file; if false, appends to it.
+  - truncate: If true, truncates existing file; if false, appends to it.
+  - reserved_size: Pre-allocates space for writing.
+  - Throws std::system_error if file cannot be opened or mapped.
 
-#### File Operations
-- `void open(const std::filesystem::path& filename, bool truncate = true)`
-  - Opens a file for writing.
-  - Automatically closes any previously opened file.
-
-- `void close() noexcept`
-  - Closes the file and releases all resources.
-  - Automatically called by destructor.
-
-- `bool is_open() const noexcept`
-  - Checks if the writer has an open file.
-
-- `explicit operator bool() const noexcept`
-  - Returns true if the writer has an open file.
+- `mmap_writer(int fd, bool truncate, size_t reserved_size = 0)`
+  - Creates a new writer for the specified file descriptor.
+  - The file descriptor will not be closed in the destructor.
+  - Throws std::invalid_argument if fd is invalid.
 
 #### Writing Operations
 - `void write(std::span<const char> buf)`
@@ -189,7 +179,8 @@ writer.write(data);
   - Expands file if necessary.
 
 - `void seek(ptrdiff_t off, seekdir dir)`
-  - Seeks relative to beginning (beg), current position (cur), or end (end).
+  - Sets the write position relative to a reference point.
+  - dir can be seekdir::beg (beginning), seekdir::cur (current position), or seekdir::end (end of file).
   - Supports negative offsets.
   - Expands file if necessary.
 
@@ -204,6 +195,15 @@ writer.write(data);
 
 - `void shrink_to_fit()`
   - Reduces mapped memory to actual file size.
+
+-  `size_t size() const noexcept`
+    - Returns the current size of the file (the maximum position that has been written to)
+    - This represents the actual data size, not the allocated capacity
+
+- `size_t capacity() const noexcept`
+    - Returns the current capacity of the mapped memory region
+    - This is the total space allocated, which may be larger than the actual data size
+    - Useful for determining how much more data can be written before expansion occurs
 
 #### Synchronization
 - `void flush(bool async = false)`

@@ -23,11 +23,10 @@ void bench(const string& filename, size_t size)
 
     start = chrono::high_resolution_clock::now();
     {
-        mmap_writer writer(filename, true);
         size_t total_size = 0;
         for (const auto& str : lines) { total_size += str.size(); }
-        writer.reserve(total_size);
-
+        mmap_writer writer(filename, true, total_size);
+        cout << "capacity: " << writer.capacity() << "\n";
         for (const auto& str : lines) { writer.write(str); }
     }
     end = chrono::high_resolution_clock::now();

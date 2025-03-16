@@ -1,260 +1,309 @@
-#include <cstring>
+#pragma once
+
+#include <algorithm>
+#include <cstdio>
 #include <fcntl.h>
-#include <filesystem>
+#include <format>
 #include <span>
+#include <string_view>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <system_error>
 #include <unistd.h>
-#include <utility>
 
 class mmap_writer
 {
 private:
-    char* mapped_ptr {};
-    int fd {-1};
-
-    size_t current_offset {};
-    size_t max_offset {};
-
-    size_t capacity {};
-    inline static const size_t default_expand_size {8192};
-    size_t expand_size {default_expand_size};
-
-
-    void expand(size_t new_size)
+    struct File
     {
-        size_t new_capacity = capacity;
-        while (new_capacity < new_size) { new_capacity += expand_size; }
-
-        if (ftruncate(fd, static_cast<off_t>(new_capacity)) == -1)
+    private:
+        static int open(std::string_view filename, bool truncate)
         {
-            const auto code = errno;
-            ::munmap(mapped_ptr, capacity);
-            ::close(fd);
-            throw std::system_error {code, std::system_category(), "ftruncate failed"};
-        }
+            const int flag = truncate ? O_TRUNC : O_APPEND;
 
-        void* new_ptr = mremap(mapped_ptr, capacity, new_capacity, MREMAP_MAYMOVE);
-        if (new_ptr == MAP_FAILED)
-        {
-            const auto code = errno;
-            ::munmap(mapped_ptr, capacity);
-            ::close(fd);
-            throw std::system_error {code, std::system_category(), "mremap failed"};
-        }
-
-        mapped_ptr = static_cast<char*>(new_ptr);
-        capacity = new_capacity;
-    }
-
-    void open_file(const std::filesystem::path& filename, bool truncate)
-    {
-        const int flag = truncate ? O_TRUNC : O_APPEND;
-
-        // When using mmap with PROT_WRITE and MAP_SHARED, the open call must use O_RDWR instead of write-only mode.
-        fd = ::open(filename.c_str(), O_RDWR | O_CREAT | flag, S_IRUSR | S_IWUSR);
-        if (fd == -1)
-        {
-            throw std::system_error {errno, std::system_category(), "Failed to open file"};
-        }
-
-        if (!truncate)
-        {
-            struct stat sb;
-            if (fstat(fd, &sb) == -1)
+            // When using mmap with PROT_WRITE and MAP_SHARED, the open call must use O_RDWR instead of write-only mode.
+            const int fd = ::open(filename.data(), O_RDWR | O_CREAT | flag, S_IRUSR | S_IWUSR);
+            if (fd == -1)
             {
-                const auto code = errno;
-                ::close(fd);
-                throw std::system_error {code, std::system_category(), "fstat failed"};
+                throw std::system_error {errno,
+                                         std::system_category(),
+                                         std::format("mmap_writer: cannot open file {}", filename)};
             }
-            current_offset = static_cast<size_t>(sb.st_size);
+
+            return fd;
         }
 
-        capacity = current_offset + expand_size;
+    public:
+        mmap_writer* writer;
+        int fd;
+        bool should_close;
 
-        if (ftruncate(fd, static_cast<off_t>(capacity)) == -1)
+        File(mmap_writer* writer_, std::string_view filename, bool truncate)
+            : writer {writer_}, fd {open(filename, truncate)}, should_close {true}
+        {}
+
+        File(mmap_writer* writer_, int fd_) : writer {writer_}, fd {fd_}, should_close {false}
         {
-            const auto code = errno;
-            ::close(fd);
-            throw std::system_error {code, std::system_category(), "ftruncate failed"};
+            if (fd < 0) { throw std::invalid_argument {"mmap_writer: invalid file descriptor"}; }
         }
 
-        void* addr = mmap(nullptr, capacity, PROT_WRITE, MAP_SHARED, fd, 0);
-        if (addr == MAP_FAILED)
+        File(const File&) = delete;
+        File& operator=(const File&) = delete;
+        File(File&& that) noexcept = delete;
+        File& operator=(File&& that) noexcept = delete;
+
+        ~File()
         {
-            const auto code = errno;
-            ::close(fd);
-            throw std::system_error {errno, std::system_category(), "mmap failed"};
-        }
-        mapped_ptr = static_cast<char*>(addr);
-    }
-
-public:
-    mmap_writer(const std::filesystem::path& filename, bool truncate) { open(filename, truncate); }
-
-    ~mmap_writer() { close(); }
-
-    mmap_writer(const mmap_writer&) = delete;
-    mmap_writer& operator=(const mmap_writer&) = delete;
-
-    mmap_writer(mmap_writer&& that) noexcept
-        : mapped_ptr {std::exchange(that.mapped_ptr, nullptr)},
-          fd {std::exchange(that.fd, -1)},
-          current_offset {std::exchange(that.current_offset, 0)},
-          max_offset {std::exchange(that.max_offset, 0)},
-          capacity {std::exchange(that.capacity, 0)},
-          expand_size {std::exchange(that.expand_size, default_expand_size)}
-
-    {}
-
-    mmap_writer& operator=(mmap_writer&& that) noexcept
-    {
-        if (this != &that)
-        {
-            close();
-            mapped_ptr = std::exchange(that.mapped_ptr, nullptr);
-            fd = std::exchange(that.fd, 0);
-            current_offset = std::exchange(that.current_offset, 0);
-            max_offset = std::exchange(that.max_offset, 0);
-            capacity = std::exchange(that.capacity, 0);
-            expand_size = std::exchange(that.expand_size, default_expand_size);
-        }
-
-        return *this;
-    }
-
-    [[nodiscard]]
-    bool is_open() const noexcept
-    {
-        return mapped_ptr != nullptr;
-    }
-
-    explicit operator bool() const noexcept { return is_open(); }
-
-    void close() noexcept
-    {
-        if (is_open())
-        {
-            ::munmap(mapped_ptr, capacity);
-            if (max_offset < capacity)
+            if (writer->max_write_pos < writer->file_size)
             {
-                std::ignore = ftruncate(fd, static_cast<off_t>(max_offset));
+                if (ftruncate(fd, static_cast<off_t>(writer->max_write_pos)) == -1)
+                {
+                    perror("mmap_writer: ftruncate failed");
+                }
             }
-            ::close(fd);
 
-            mapped_ptr = nullptr;
-            fd = -1;
-            current_offset = 0;
-            max_offset = 0;
-            capacity = 0;
-            expand_size = default_expand_size;
+            if (should_close && ::close(fd) == -1) { perror("mmap_writer: close file failed"); }
         }
-    }
 
-    void open(const std::filesystem::path& filename, bool truncate = true)
-    {
-        close();
-        open_file(filename, truncate);
-    }
-
-    void reserve(size_t new_size) { expand(new_size); }
-    void set_expand_size(size_t new_expand_size) { expand_size = new_expand_size; }
-
-    void shrink_to_fit()
-    {
-        if (capacity == max_offset) { return; }
-
-        void* new_ptr = mremap(mapped_ptr, capacity, max_offset, MREMAP_MAYMOVE);
-        if (new_ptr == MAP_FAILED)
+        [[nodiscard]]
+        size_t file_size() const
         {
-            throw std::system_error {errno, std::system_category(), "mremap failed"};
+            struct stat state_buf;
+            if (::fstat(fd, &state_buf) == -1)
+            {
+                throw std::system_error {
+                    errno,
+                    std::system_category(),
+                    std::format("mmap_writer: fstat failed with fd = {}", std::to_string(fd))};
+            }
+
+            return static_cast<size_t>(state_buf.st_size);
         }
 
-        std::ignore = ftruncate(fd, static_cast<off_t>(max_offset));
+        void resize(size_t new_size)
+        {
+            if (ftruncate(fd, static_cast<off_t>(new_size)) == -1)
+            {
+                throw std::system_error {errno,
+                                         std::system_category(),
+                                         "mmap_writer: ftruncate failed"};
+            }
+        }
+    };
 
-        mapped_ptr = static_cast<char*>(new_ptr);
-        capacity = max_offset;
-    }
-
-    [[nodiscard]]
-    size_t tell() const noexcept
+    struct MmapData
     {
-        return current_offset;
-    }
+    public:
+        mmap_writer* writer;
 
-    enum seekdir : unsigned char
+        char* mapped_ptr {};
+
+        explicit MmapData(mmap_writer* writer_) : writer {writer_} {}
+
+        MmapData(const MmapData&) = delete;
+        MmapData& operator=(const MmapData&) = delete;
+        MmapData(MmapData&& that) noexcept = delete;
+        MmapData& operator=(MmapData&& that) noexcept = delete;
+
+        ~MmapData()
+        {
+            if (mapped_ptr != nullptr && ::munmap(mapped_ptr, writer->file_size) == -1)
+            {
+                perror("mmap_writer: munmap failed");
+            }
+        }
+
+        void memory_map()
+        {
+            void* addr =
+                ::mmap(nullptr, writer->file_size, PROT_WRITE, MAP_SHARED, writer->file.fd, 0);
+            if (addr == MAP_FAILED)
+            {
+                throw std::system_error {
+                    errno,
+                    std::system_category(),
+                    std::format("mmap_writer: mmap failed with fd = {}", writer->file.fd)};
+            }
+
+            mapped_ptr = static_cast<char*>(addr);
+        }
+
+        void remap(size_t new_size)
+        {
+            void* new_ptr = mremap(mapped_ptr, writer->file_size, new_size, MREMAP_MAYMOVE);
+            if (new_ptr == MAP_FAILED)
+            {
+                throw std::system_error {errno,
+                                         std::system_category(),
+                                         "mmap_writer: mremap failed"};
+            }
+
+            mapped_ptr = static_cast<char*>(new_ptr);
+        }
+
+        void sync(bool async)
+        {
+            if (msync(mapped_ptr, writer->max_write_pos, async ? MS_ASYNC : MS_SYNC) == -1)
+            {
+                throw std::system_error {errno,
+                                         std::system_category(),
+                                         "mmap_writer: msync failed"};
+            }
+        }
+    };
+
+    size_t file_size;
+    size_t write_pos;
+    size_t max_write_pos;
+
+    enum class seekdir : unsigned char
     {
         beg,
         cur,
         end
     };
 
+    size_t expand_size {8192};
+
+    File file;
+    MmapData mmap_data;
+
+    void expand(size_t required_size)
+    {
+        if (expand_size == 0)
+        {
+            throw std::logic_error {"mmap_writer: expand_size must be greater than 0"};
+        }
+
+        size_t new_file_size = file_size;
+        while (new_file_size < required_size) { new_file_size += expand_size; }
+
+        file.resize(new_file_size);
+        mmap_data.remap(new_file_size);
+        file_size = new_file_size;
+    }
+
+    void init(bool truncate, size_t reserved_size)
+    {
+        const size_t old_file_size = file.file_size();
+        if (old_file_size == 0) { file_size = (reserved_size > 0 ? reserved_size : 8192); }
+        else { file_size = old_file_size + reserved_size; }
+
+        file.resize(file_size);
+        mmap_data.memory_map();
+
+        if (!truncate)
+        {
+            write_pos = old_file_size;
+            max_write_pos = old_file_size;
+        }
+        else
+        {
+            write_pos = 0;
+            max_write_pos = 0;
+        }
+    }
+
+public:
+    mmap_writer(std::string_view filename, bool truncate, size_t reserved_size = 0)
+        : file {this, filename, truncate}, mmap_data {this}
+    {
+        init(truncate, reserved_size);
+    }
+
+    mmap_writer(int fd, bool truncate, size_t reserved_size = 0) : file {this, fd}, mmap_data {this}
+    {
+        init(truncate, reserved_size);
+    }
+
+
+    [[nodiscard]] size_t size() const noexcept { return max_write_pos; }
+
+    [[nodiscard]] size_t capacity() const noexcept { return file_size; }
+
+    void set_expand_size(size_t new_expand_size)
+    {
+        expand_size = new_expand_size > 0 ? new_expand_size : 8192;
+    }
+
+    void shrink_to_fit()
+    {
+        if (max_write_pos < file_size)
+        {
+            file.resize(max_write_pos);
+            mmap_data.remap(max_write_pos);
+            file_size = max_write_pos;
+        }
+    }
+
+    [[nodiscard]]
+    size_t tell() const noexcept
+    {
+        return write_pos;
+    }
+
+    static const seekdir beg {seekdir::beg};
+    static const seekdir cur {seekdir::cur};
+    static const seekdir end {seekdir::end};
+
     void seek(size_t pos)
     {
-        if (pos > capacity) { expand(pos); }
+        if (pos > file_size) { expand(pos); }
 
-        current_offset = pos;
-        max_offset = std::max(max_offset, current_offset);
+        write_pos = pos;
+        max_write_pos = std::max(max_write_pos, write_pos);
     }
 
     void seek(ptrdiff_t off, seekdir dir)
     {
-        size_t new_offset {current_offset};
+        size_t new_pos {write_pos};
 
         switch (dir)
         {
         case seekdir::beg:
-            if (off < 0) { new_offset = 0; }
-            else { new_offset = static_cast<size_t>(off); }
+            new_pos = off < 0 ? 0 : static_cast<size_t>(off);
             break;
 
         case seekdir::cur:
             if (off < 0)
             {
-                new_offset = (static_cast<size_t>(-off) > current_offset)
-                                 ? 0
-                                 : current_offset - static_cast<size_t>(-off);
+                new_pos = (static_cast<size_t>(-off) > write_pos)
+                              ? 0
+                              : write_pos - static_cast<size_t>(-off);
             }
-            else { new_offset += static_cast<size_t>(off); }
+            else { new_pos += static_cast<size_t>(off); }
             break;
 
         case seekdir::end:
             if (off < 0)
             {
-                new_offset = (static_cast<size_t>(-off) > max_offset)
-                                 ? 0
-                                 : max_offset - static_cast<size_t>(-off);
+                new_pos = (static_cast<size_t>(-off) > max_write_pos)
+                              ? 0
+                              : max_write_pos - static_cast<size_t>(-off);
             }
-            else { new_offset = max_offset + static_cast<size_t>(off); }
+            else { new_pos = max_write_pos + static_cast<size_t>(off); }
+            break;
+        default:
             break;
         }
 
-        if (new_offset > capacity) { expand(new_offset); }
-
-        current_offset = new_offset;
-        max_offset = std::max(max_offset, current_offset);
+        seek(new_pos);
     }
 
-    void write(std::span<const char> buf)
+    void write(std::span<const char> data)
     {
-        if (current_offset + buf.size() > capacity) { expand(current_offset + buf.size()); }
-        memcpy(mapped_ptr + current_offset, buf.data(), buf.size());
-        current_offset += buf.size();
-        max_offset = std::max(max_offset, current_offset);
+        if (write_pos + data.size() > file_size) { expand(write_pos + data.size()); }
+        std::ranges::copy(data, mmap_data.mapped_ptr + write_pos);
+        write_pos += data.size();
+        max_write_pos = std::max(max_write_pos, write_pos);
     }
 
-    void pwrite(size_t offset, std::span<const char> buf)
+    void pwrite(std::span<const char> data, size_t offset)
     {
-        if (offset + buf.size() > capacity) { expand(offset + buf.size()); }
-        memcpy(mapped_ptr + offset, buf.data(), buf.size());
-        max_offset = std::max(max_offset, offset + buf.size());
+        if (offset + data.size() > file_size) { expand(offset + data.size()); }
+        std::ranges::copy(data, mmap_data.mapped_ptr + offset);
+        max_write_pos = std::max(max_write_pos, offset + data.size());
     }
 
-    void flush(bool async = false)
-    {
-        if (msync(mapped_ptr, max_offset, async ? MS_ASYNC : MS_SYNC) == -1)
-        {
-            throw std::system_error {errno, std::system_category(), "msync failed"};
-        }
-    }
+    void flush(bool async = false) { mmap_data.sync(async); }
 };
