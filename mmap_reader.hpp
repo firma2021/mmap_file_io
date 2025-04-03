@@ -153,6 +153,9 @@ private:
         return line;
     }
 
+    struct Sentinel
+    {};
+
     class LineReader
     {
     private:
@@ -172,17 +175,14 @@ private:
 
             iterator& operator++() { return *this; }
 
-            bool operator!=([[maybe_unused]] const iterator& eof_iter) const noexcept
-            {
-                return !reader.eof();
-            }
+            bool operator!=(Sentinel /*unused*/) const noexcept { return !reader.eof(); }
         };
 
     public:
         explicit LineReader(mmap_reader& r, char delim) : reader {r}, delimiter {delim} {}
 
         iterator begin() { return iterator {reader, delimiter}; }
-        iterator end() { return iterator {reader, delimiter}; }
+        Sentinel end() { return {}; }
     };
 
     class CharReader
@@ -202,17 +202,14 @@ private:
 
             iterator& operator++() { return *this; }
 
-            bool operator!=([[maybe_unused]] const iterator& eof_iter) const noexcept
-            {
-                return !reader.eof();
-            }
+            bool operator!=(Sentinel /*unused*/) const noexcept { return !reader.eof(); }
         };
 
     public:
         explicit CharReader(mmap_reader& r) : reader {r} {}
 
         iterator begin() { return iterator {reader}; }
-        iterator end() { return iterator {reader}; }
+        Sentinel end() { return {}; }
     };
 
 public:
